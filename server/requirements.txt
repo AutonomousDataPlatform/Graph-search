@@ -1,0 +1,27 @@
+# Web Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# Database
+neo4j>=5.14.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Base dependencies (resolve first to avoid conflicts)
+typing-extensions>=4.10.0
+numpy>=1.21.0
+Pillow>=9.0.0
+
+# ML/AI Models
+# IMPORTANT: Install PyTorch separately first to avoid dependency conflicts
+# See installation instructions in README.md
+# CPU: pip install torch==2.7.1 torchvision==0.22.1 torchaudio --index-url https://download.pytorch.org/whl/cpu
+# CUDA 12.1: pip install torch==2.7.1 torchvision==0.22.1 torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Note: torch 2.7.1 is tested and working on Windows
+ftfy
+regex
+git+https://github.com/openai/CLIP.git
+multilingual-clip
+transformers>=4.20.0

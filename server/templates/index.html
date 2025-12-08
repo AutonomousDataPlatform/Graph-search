@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Unified Driving Scene Search</title>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>🚗 Unified Driving Scene Search</h1>
+        <div class="subtitle">Search across KITTI, BDD100k, nuScenes, CADC & Waymo datasets with advanced filters</div>
+
+        <!-- Search Mode Tabs -->
+        <div class="search-mode-tabs">
+            <button class="tab-button active" onclick="setSearchMode('text')">📝 텍스트 검색</button>
+            <button class="tab-button" onclick="setSearchMode('image')">🖼️ 이미지 검색</button>
+        </div>
+
+        <!-- Text Search Section -->
+        <div id="textSearchSection" class="search-section">
+            <div class="search-row">
+                <input type="text" id="searchQuery" class="search-input"
+                       placeholder="Search for driving scenes (e.g., 'car on the road at night', 'rainy weather with pedestrians')" />
+                <div class="search-actions">
+                    <button class="search-button" onclick="search()">🔍 Search</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Image Search Section (with Hybrid functionality) -->
+        <div id="imageSearchSection" class="search-section" style="display: none;">
+            <!-- Optional Text Input for Hybrid Search -->
+            <div class="hybrid-text-input" style="margin-bottom: 20px;">
+                <input type="text" id="imageTextQuery" class="search-input"
+                       placeholder="추가 텍스트 설명 (선택사항) - 예: 'night', 'rainy', 'highway'">
+                <div style="margin-top: 8px; font-size: 12px; color: #666; text-align: center;">
+                    💡 텍스트를 입력하면 이미지와 텍스트를 함께 활용한 하이브리드 검색을 수행합니다
+                </div>
+            </div>
+
+            <!-- Image Upload Area -->
+            <div class="image-upload-area">
+                <div class="upload-zone" id="imageUploadZone">
+                    <div class="upload-icon">📁</div>
+                    <div class="upload-text">
+                        <strong>이미지를 드래그하거나 클릭하여 업로드</strong>
+                        <br><small>JPG, PNG, WebP 지원 (최대 10MB)</small>
+                    </div>
+                    <input type="file" id="imageFileInput" accept="image/*" style="display: none;">
+                </div>
+
+                <!-- 업로드된 이미지 미리보기 -->
+                <div id="imagePreview" class="image-preview" style="display: none;">
+                    <img id="previewImage" src="" alt="Preview">
+                    <div class="image-info">
+                        <div class="image-name" id="imageName"></div>
+                        <div class="image-size" id="imageSize"></div>
+                        <button class="remove-image-btn" onclick="removeImage()">✖️ 제거</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="search-actions" style="margin-top: 15px;">
+                <button class="search-button" onclick="searchByImage()">🔍 검색</button>
+                <button class="search-button" onclick="removeImage()" style="background: #6c757d;">↻ 이미지 제거</button>
+            </div>
+        </div>
+
+
+        <!-- Graph Filters Section -->
+        <div class="search-section">
+            <div class="collapsible" onclick="toggleFilters()">
+                <h3 style="margin: 0; color: #555;">⚙️ Graph Filters</h3>
+                <span class="toggle-icon" id="filterToggle">▼</span>
+            </div>
+            <div style="margin: 8px 0; font-size: 12px; color: #666; text-align: center;">
+                🔗 Filter by graph relationships and semantic properties
+            </div>
+
+            <div id="filterContent" style="display: none; margin-top: 15px;">
+                <!-- Dataset Selection - Top Row -->
+                <div class="filter-group" style="margin-bottom: 15px;">
+                    <h4>📊 Datasets</h4>
+                    <div id="datasetFilters" style="display: flex; gap: 20px; flex-wrap: wrap;">
+                        Loading...
+                    </div>
+                </div>
+
+                <!-- Environment and Driving Context - Bottom Row -->
+                <div class="filter-section" style="grid-template-columns: 1fr 1fr 1fr; gap: 15px;">
+                    <!-- Environment Group: Weather, Time of Day, Road Condition -->
+                    <div class="filter-group">
+                        <h4>🌍 Environment</h4>
+                        <div class="filter-section" style="grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                            <div>
+                                <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">🌤️ Weather</div>
+                                <div id="weatherFilters">Loading...</div>
+                            </div>
+                            <div>
+                                <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">🕐 Time of Day</div>
+                                <div id="timeFilters">Loading...</div>
+                            </div>
+                            <div>
+                                <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">🛣️ Road Condition</div>
+                                <div id="roadFilters">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Driving Context Group: Densities -->
+                    <div class="filter-group">
+                        <h4>🚗 Driving Context</h4>
+                        <div class="filter-section" style="grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                            <div>
+                                <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">🚦 Traffic Density</div>
+                                <div id="trafficFilters">Loading...</div>
+                            </div>
+                            <div>
+                                <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">🚶 Pedestrian Density</div>
+                                <div id="pedestrianFilters">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Object Filters: category + min count -->
+                    <div class="filter-group">
+                        <h4>🧩 Object Filters</h4>
+                        <div id="objectFilters">
+                            <div style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+                                <select id="objectCategorySelect" style="min-width: 200px;"><option>Loading...</option></select>
+                                <input type="number" id="objectMinInput" min="1" step="1" value="1" style="width:90px;" />
+                                <button class="search-button" style="padding:8px 12px; font-size:13px;" onclick="addObjectFilter()">➕ Add</button>
+                            </div>
+                            <div id="selectedObjects" style="margin-top:10px; display:flex; gap:8px; flex-wrap: wrap;"></div>
+                            <div style="margin-top: 8px; font-size: 12px; color: #666;">Tip: 선택 후 min 값을 조정하거나 제거할 수 있습니다.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top: 15px;">
+                    <button class="search-button" onclick="resetFilters()" style="background: #6c757d;">↻ Reset All Filters</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="status"></div>
+        <div id="results"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
