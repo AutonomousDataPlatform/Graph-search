@@ -178,6 +178,22 @@ class UnifiedSearchEngine:
                     """)
                     logger.info("Created CLIP image vector index")
 
+                # Create Eval-specific CLIP image embedding index
+                if 'eval_clip_image_vector_index' not in index_names:
+                    logger.info("Creating Eval-specific CLIP image vector index...")
+                    session.run("""
+                    CREATE VECTOR INDEX eval_clip_image_vector_index IF NOT EXISTS
+                    FOR (s:Eval)
+                    ON s._img_embedding_ViT_L_14
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 768,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                    logger.info("Created Eval-specific CLIP image vector index")
+
             logger.info("Vector indexes are ready")
             return True
 
@@ -269,19 +285,27 @@ class UnifiedSearchEngine:
                           limit: int, page: int = 1,
                           query_embeddings: Dict[str, List[float]] = None,
                           image_embeddings: Dict[str, List[float]] = None,
-                          image_weight: float = 0.6, text_weight: float = 0.4) -> tuple:
+                          image_weight: float = 0.6, text_weight: float = 0.4,
+                          mode: str = None) -> tuple:
         # Get embeddings
         clip_image_query = image_embeddings.get('clip_image') if image_embeddings else None
         clip_text_query = query_embeddings.get('clip_text') if query_embeddings else None
 
-        # Always use clip_image_vector_index for kNN search
+        # Determine which vector index to use based on mode
         # CLIP's image and text embeddings share the same latent space
+        if mode == 'eval':
+            # Use Eval-specific vector index for evaluation
+            vector_index = 'eval_clip_image_vector_index'
+        else:
+            # Use general vector index
+            vector_index = 'clip_image_vector_index'
+
         if clip_image_query:
             primary_vector = clip_image_query
-            primary_index = 'clip_image_vector_index'
+            primary_index = vector_index
         elif clip_text_query:
             primary_vector = clip_text_query
-            primary_index = 'clip_image_vector_index'
+            primary_index = vector_index
         else:
             return self._build_filter_only_query(datasets, object_filters, weather,
                                                  time_of_day, road_condition,
@@ -304,7 +328,7 @@ class UnifiedSearchEngine:
         # Add filter conditions
         filter_conditions = []
 
-        # Dataset filter (only if datasets specified)
+        # Dataset filter (skip for eval mode by not passing datasets parameter)
         if datasets:
             filter_conditions.append("ds.name IN $datasets")
 
@@ -575,6 +599,7 @@ LIMIT $fetch_limit
     def search_nodes(self, query_embeddings: Dict[str, List[float]] = None,
                      image_embeddings: Dict[str, List[float]] = None,
                      image_weight: float = 0.6, text_weight: float = 0.4,
+                     mode: str = None,
                      datasets: List[str] = None,
                      object_filters: Dict[str, int] = None,
                      weather: List[str] = None,
@@ -618,7 +643,8 @@ LIMIT $fetch_limit
             traffic_density, pedestrian_density, limit, page,
             query_embeddings=query_embeddings,
             image_embeddings=image_embeddings,
-            image_weight=image_weight, text_weight=text_weight
+            image_weight=image_weight, text_weight=text_weight,
+            mode=mode
         )
         t_query_build = time.time() - t_query_build_start
         logger.info("[%s] Query build: %.2fms", search_type, t_query_build * 1000)
@@ -836,6 +862,7 @@ async def search_unified(
     image: Optional[UploadFile] = File(None),
     image_weight: float = Form(0.6),
     text_weight: float = Form(0.4),
+    mode: str = Form(None),
     datasets: str = Form('[]'),
     object_filters: str = Form("{}"),
     weather: str = Form("[]"),
@@ -915,6 +942,7 @@ async def search_unified(
             image_embeddings=image_embeddings,
             image_weight=image_weight,
             text_weight=text_weight,
+            mode=mode,
             datasets=datasets_list,
             object_filters=object_filters_dict,
             weather=weather_list,
