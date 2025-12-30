@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from PIL import Image
 import io
@@ -47,12 +48,6 @@ load_dotenv()
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 logger = logging.getLogger(__name__)
-
-# FastAPI app configuration from environment
-app = FastAPI(
-    title=os.getenv("API_TITLE", "Unified Driving Scene Search"),
-    version=os.getenv("API_VERSION", "2.0.0")
-)
 
 # Pydantic models
 class SearchRequest(BaseModel):
@@ -826,9 +821,10 @@ search_engine = UnifiedSearchEngine(
     neo4j_password=os.getenv("NEO4J_PASSWORD", "bg.cha@Int2.us")
 )
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize connections and models on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan events"""
+    # Startup
     if not search_engine.connect_neo4j():
         raise Exception("Failed to connect to Neo4j")
 
@@ -841,10 +837,17 @@ async def startup_event():
     if not search_engine.load_models():
         raise Exception("Failed to load models")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up connections on shutdown"""
+    yield
+
+    # Shutdown
     search_engine.close()
+
+# FastAPI app configuration from environment
+app = FastAPI(
+    title=os.getenv("API_TITLE", "Unified Driving Scene Search"),
+    version=os.getenv("API_VERSION", "2.0.0"),
+    lifespan=lifespan
+)
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
