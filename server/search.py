@@ -789,13 +789,18 @@ LIMIT $fetch_limit
                 dataset_result = session.run("MATCH (n:DataCatalog) RETURN n.name as name")
                 datasets = [r['name'] for r in dataset_result if r['name']]
 
+                # Get scenario tags   
+                scenario_tag_result = session.run("MATCH (e:ScenarioEvent) RETURN e.category AS category,collect(DISTINCT e.type) AS types ORDER BY category")
+                scenario_tags = {r['category']: sorted(r['types']) for r in scenario_tag_result if r['category'] and r['types']}
+
                 return {
                     'datasets': sorted(datasets),
                     'weather': sorted(weather),
                     'time_of_day': sorted(time_of_day),
                     'road_condition': sorted(road_condition),
                     'traffic_density': sorted(traffic_density),
-                    'pedestrian_density': sorted(pedestrian_density)
+                    'pedestrian_density': sorted(pedestrian_density),
+                    'scenario_tags': scenario_tags
                 }
         except Exception as e:
             logger.error(f"Failed to get filter options: {e}")
@@ -805,7 +810,8 @@ LIMIT $fetch_limit
                 'time_of_day': [],
                 'road_condition': [],
                 'traffic_density': [],
-                'pedestrian_density': []
+                'pedestrian_density': [],
+                'scenario_tags': {}
             }
 
     def close(self):
