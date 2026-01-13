@@ -74,18 +74,37 @@ class ObjectComposition(BaseModel):
     composition: Dict[str, int]  # {category: count}
     total: int
 
+class ScenarioTag(BaseModel):
+    type: str
+    timestamp: int
+    timestep: float
+
 class SearchResult(BaseModel):
     node_id: str
     dataset: str
     data_catalog_id: str
     token: str
     filepath: str
+    original_filepath: str
     image_url: str
     score: float
     scores: Dict[str, float]
     objects: ObjectComposition
     environment: Dict[str, str]  # weather, time_of_day, road_condition
     context: Dict[str, str]  # traffic_density, pedestrian_density
+
+class SearchScenarioResult(BaseModel):
+    node_id: str
+    dataset: str
+    data_catalog_id: str
+    scenario_id: str
+    original_filepath: str
+    scenario_tag: List[ScenarioTag]
+
+class SearchScenarioResponse(BaseModel):
+    results: List[SearchScenarioResult]
+    page: int = 1
+    has_more: bool = False
 
 class SearchResponse(BaseModel):
     results: List[SearchResult]
@@ -484,6 +503,58 @@ LIMIT $fetch_limit
 
         return query, query_params
 
+    def _build_scenario_filter_query(self, object_filters: Dict[str, int],
+                                 scenario_tag: List[str], limit: int, page: int = 1) -> tuple:
+
+        query = f"""
+        MATCH (s:Scene)-[:HAS_EVENT]->(se:ScenarioEvent)
+        """
+
+        filter_conditions = []
+
+        if scenario_tag:
+            query += "WHERE se.type IN $scenario_tag"
+
+        query += f"""
+        WITH s, collect(DISTINCT se) as scenario_events
+        WITH s, [se IN scenario_events | {{
+            type: se.type,
+            timestamp: se.timestamp,
+            timestep: se.timestep
+        }}] as scenario_tag
+        MATCH (s)-[:IN_CATALOG]->(ds:DataCatalog)
+        """
+
+
+        if filter_conditions:
+            query += f"WHERE {' AND '.join(filter_conditions)}"
+
+        # Return fields
+        return_fields = [
+            "elementId(s) as node_id",
+            "ds.name as dataset",
+            "ds.catalog_id as data_catalog_id",
+            "s.scenario_id as scenario_id",
+            "scenario_tag"        
+        ]
+
+        skip_count = (page - 1) * limit
+        fetch_limit = limit + 1
+
+        query += f"""
+        RETURN {', '.join(return_fields)}
+        ORDER BY id(s)
+        SKIP $skip_count
+        LIMIT $fetch_limit
+        """
+
+        query_params = {'skip_count': skip_count, 'fetch_limit': fetch_limit}
+
+        if scenario_tag:
+            query_params['scenario_tag'] = scenario_tag
+        
+        return query, query_params
+
     def _build_filter_only_query(self, datasets: List[str], object_filters: Dict[str, int],
                                  weather: List[str], time_of_day: List[str],
                                  road_condition: List[str], traffic_density: List[str],
@@ -590,6 +661,71 @@ LIMIT $fetch_limit
                 query_params[f'min_{category.lower().replace(" ", "_").replace("/", "_")}'] = min_count
 
         return query, query_params
+
+    def search_scenario_nodes(self, scenario_tag: List[str],
+                     object_filters: Dict[str, int] = None,
+                     limit: int = 24,
+                     page: int = 1) -> Dict:
+
+        # PERFORMANCE: Start timing
+        t_start = time.time()
+
+        # Set defaults for filter parameters
+        object_filters = object_filters or {}
+        scenario_tag = scenario_tag or []
+
+        # Determine search type for logging
+        search_type = "SCENARIO-FILTER"
+
+        # Use kNN search query with vector indexes
+        t_query_build_start = time.time()
+        query, query_params = self._build_scenario_filter_query(
+            object_filters, scenario_tag, limit, page
+        )
+        t_query_build = time.time() - t_query_build_start
+        logger.info("[%s] Query build: %.2fms", search_type, t_query_build * 1000)
+        try:
+            with self.driver.session(fetch_size=1000) as session:
+                t_db_start = time.time()
+                result = session.run(query, **query_params)
+
+                nodes = []
+                record_count = 0
+                
+                for record in result:
+                    record_count += 1
+                    
+                    # Extract required fields (always present)
+                    node_id = record['node_id']
+                    dataset = record['dataset']
+                    data_catalog_id = record['data_catalog_id']
+                    scenario_id = record['scenario_id']
+                    scenario_tag = record['scenario_tag']
+                    
+                    nodes.append({
+                        'node_id': node_id,
+                        'dataset': dataset,
+                        'data_catalog_id': data_catalog_id,
+                        'scenario_id': scenario_id,
+                        'scenario_tag': scenario_tag,
+                    })
+
+                t_db_total = time.time() - t_db_start
+                t_total = time.time() - t_start
+
+                logger.info("[%s] Neo4j query + fetch: %.2fms", search_type, t_db_total * 1000)
+                logger.info("[%s] Total search time: %.2fms (found %d results, page %d)",
+                           search_type, t_total * 1000, len(nodes), page)
+
+                return {
+                    'nodes': nodes[:limit],
+                    'has_more': False
+                }
+
+        except Exception as e:
+            logger.error("Search failed: %s", e)
+            logger.error("Query params: %s", list(query_params.keys()))
+            return {'nodes': [], 'has_more': False}
 
     def search_nodes(self, query_embeddings: Dict[str, List[float]] = None,
                      image_embeddings: Dict[str, List[float]] = None,
@@ -865,6 +1001,67 @@ async def home():
 # Serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.post("/scenario", response_model=SearchScenarioResponse)
+async def search_scenario(
+    object_filters: str = Form("{}"),
+    scenario_tag: str = Form("[]"),
+    limit: int = Form(100),
+    page: int = Form(1)
+):
+    try:
+        # PERFORMANCE: Start timing for entire API request
+        t_api_start = time.time()
+
+        # Parse filter parameters
+        try:
+            scenario_tag_list = json.loads(scenario_tag) if scenario_tag else []
+            object_filters_dict = json.loads(object_filters) if object_filters else {}
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in parameters: {str(e)}")
+
+        search_type = "SCENARIO-FILTER"
+
+        logger.info("[%s] Search started: limit=%d, page=%d", search_type, limit, page)
+
+        # Search with unified function
+        t_search_start = time.time()
+        search_result = search_engine.search_scenario_nodes(
+            scenario_tag=scenario_tag_list,
+            object_filters=object_filters_dict,
+            limit=limit,
+            page=page
+        )
+        t_search = time.time() - t_search_start
+
+        nodes = search_result['nodes']
+        has_more = search_result['has_more']
+
+        # Format results
+        t_format_start = time.time()
+        results = []
+        for node in nodes:
+            results.append(SearchScenarioResult(
+                node_id=node['node_id'],
+                dataset=node['dataset'],
+                data_catalog_id=node['data_catalog_id'],
+                scenario_id=node['scenario_id'],
+                original_filepath= "https://bdd100k-dataset-images.s3.ap-northeast-1.amazonaws.com/train/0000f77c-6257be58.jpg",
+                scenario_tag=node['scenario_tag']
+            ))
+
+        t_format = time.time() - t_format_start
+        t_api_total = time.time() - t_api_start
+
+        logger.info("[%s API] Completed in %.2fms: %d results, page %d, has_more=%s (search: %.1fms, format: %.1fms)",
+                   search_type, t_api_total * 1000, len(results), page, has_more,
+                   t_search * 1000, t_format * 1000)
+
+        return SearchScenarioResponse(results=results, page=page, has_more=has_more)
+
+    except Exception as e:
+        logger.error("[API] Search request failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
 @app.post("/search", response_model=SearchResponse)
 async def search_unified(
     query: str = Form(""),
@@ -979,6 +1176,7 @@ async def search_unified(
                 data_catalog_id=node['data_catalog_id'],
                 token=node['token'],
                 filepath=node['filepath'],
+                original_filepath= "https://bdd100k-dataset-images.s3.ap-northeast-1.amazonaws.com/train/0000f77c-6257be58.jpg",
                 image_url=f"{node['dataset_source']}/{encoded_filepath}",
                 score=node['score'],
                 scores=node['scores'],
