@@ -412,28 +412,27 @@ class UnifiedSearchEngine:
             # HYBRID MODE: Both image and text
             # Calculate image similarity from kNN (primary search with image)
             # Calculate text similarity by comparing text query with image embeddings (same CLIP space)
-            query += f"""WITH s, ds, w, t, r, c, knn_score, {category_vars_str}
-    knn_score as img_similarity,
-    vector.similarity.cosine(s._img_embedding_ViT_L_14, $clip_text_query) as txt_similarity
-WITH s, ds, w, t, r, c, {category_vars_str}img_similarity, txt_similarity,
-    ($image_weight * img_similarity + $text_weight * txt_similarity) as final_score
-"""
+            query += f"""
+            WITH s, ds, w, t, r, c, knn_score, {category_vars_str}
+                knn_score as img_similarity,
+                vector.similarity.cosine(s._img_embedding_ViT_L_14, $clip_text_query) as txt_similarity
+            WITH s, ds, w, t, r, c, {category_vars_str}img_similarity, txt_similarity,
+                ($image_weight * img_similarity + $text_weight * txt_similarity) as final_score
+            """
         elif clip_image_query:
             # IMAGE-ONLY MODE
-            query += f"""WITH s, ds, w, t, r, c, knn_score, {category_vars_str}
-    knn_score as img_similarity,
-    0.0 as txt_similarity,
-    knn_score as final_score
-"""
+            query += f"""
+            WITH s, ds, w, t, r, c, {category_vars_str}knn_score as final_score,
+            knn_score as img_similarity,
+            0.0 as txt_similarity
+            """
         elif clip_text_query:
             # TEXT-ONLY MODE
-            # Since we use clip_image_vector_index, knn_score is the text similarity
-            query += f"""WITH s, ds, w, t, r, c, knn_score, {category_vars_str}
-    0.0 as img_similarity,
-    knn_score as txt_similarity
-WITH s, ds, w, t, r, c, {category_vars_str}img_similarity, txt_similarity,
-    txt_similarity as final_score
-"""
+            query += f"""
+            WITH s, ds, w, t, r, c, {category_vars_str}knn_score as final_score,
+            0.0 as img_similarity,
+            knn_score as txt_similarity
+            """
 
         # Build RETURN clause
         return_fields = [
@@ -461,11 +460,11 @@ WITH s, ds, w, t, r, c, {category_vars_str}img_similarity, txt_similarity,
 
         # Add RETURN, ORDER BY, SKIP, and LIMIT
         query += f"""
-RETURN {', '.join(return_fields)}
-ORDER BY final_score DESC
-SKIP $skip_count
-LIMIT $fetch_limit
-"""
+                RETURN {', '.join(return_fields)}
+                ORDER BY final_score DESC
+                SKIP $skip_count
+                LIMIT $fetch_limit
+                """
 
         # Prepare parameters
         query_params = {
@@ -569,24 +568,37 @@ LIMIT $fetch_limit
         query = f"""
         MATCH (s:Sample)-[:IN_CATALOG]->(ds:DataCatalog)
         WHERE {' AND '.join(where_conditions)}
-        MATCH (s)-[:HAS_WEATHER]->(w:Weather)
-        MATCH (s)-[:HAS_TIME_OF_DAY]->(t:TimeOfDay)
-        MATCH (s)-[:HAS_ROAD_CONDITION]->(r:RoadCondition)
-        MATCH (s)-[:HAS_CONTEXT]->(c:DrivingContext)
         """
 
         filter_conditions = []
+        return_fields = [
+            "elementId(s) as node_id",
+            "ds.source as dataset_source",
+            "ds.name as dataset",
+            "ds.catalog_id as data_catalog_id",
+            "s.filepath as filepath",
+            "s._key as token",
+            "w.name as weather",
+            "t.name as time_of_day",
+            "r.name as road_condition",
+            "c.traffic_density as traffic_density",
+            "c.pedestrian_density as pedestrian_density",
+        ]
 
+        # 필터 사용 시에만 MATCH + WHERE로 조기 필터링 (성능). 변수는 wf,tf,rf,cf로 구분해 마지막 OPTIONAL MATCH(w,t,r,c)와 분리
         if weather:
-            filter_conditions.append("w.name IN $weather")
+            query += "\n        MATCH (s)-[:HAS_WEATHER]->(wf:Weather) WHERE wf.name IN $weather"
         if time_of_day:
-            filter_conditions.append("t.name IN $time_of_day")
+            query += "\n        MATCH (s)-[:HAS_TIME_OF_DAY]->(tf:TimeOfDay) WHERE tf.name IN $time_of_day"
         if road_condition:
-            filter_conditions.append("r.name IN $road_condition")
-        if traffic_density:
-            filter_conditions.append("c.traffic_density IN $traffic_density")
-        if pedestrian_density:
-            filter_conditions.append("c.pedestrian_density IN $pedestrian_density")
+            query += "\n        MATCH (s)-[:HAS_ROAD_CONDITION]->(rf:RoadCondition) WHERE rf.name IN $road_condition"
+        if traffic_density or pedestrian_density:
+            c_where = []
+            if traffic_density:
+                c_where.append("cf.traffic_density IN $traffic_density")
+            if pedestrian_density:
+                c_where.append("cf.pedestrian_density IN $pedestrian_density")
+            query += "\n        MATCH (s)-[:HAS_CONTEXT]->(cf:DrivingContext) WHERE " + " AND ".join(c_where)
 
         if object_filters:
             category_counts = []
@@ -598,7 +610,7 @@ LIMIT $fetch_limit
 
             query += f"""
             MATCH (s:Sample)-[det_rel:DETECTED_OBJECT]->(o:Object)
-            WITH s, ds, w, t, r, c,
+            WITH s, ds,
                 {','.join(category_counts)}
             """
 
@@ -609,37 +621,28 @@ LIMIT $fetch_limit
         if filter_conditions:
             query += f"WHERE {' AND '.join(filter_conditions)}\n"
 
-        # Return fields
-        return_fields = [
-            "elementId(s) as node_id",
-            "ds.source as dataset_source",
-            "ds.name as dataset",
-            "ds.catalog_id as data_catalog_id",
-            "s.filepath as filepath",
-            "s._key as token",
-            "0.0 as img_similarity",
-            "0.0 as txt_similarity",
-            "0.0 as final_score",
-            "w.name as weather",
-            "t.name as time_of_day",
-            "r.name as road_condition",
-            "c.traffic_density as traffic_density",
-            "c.pedestrian_density as pedestrian_density"
-        ]
-
         if object_filters:
             for category in object_filters.keys():
                 category_var = category.lower().replace(' ', '_').replace('/', '_')
                 return_fields.append(f"{category_var}_count")
 
+        # SKIP/LIMIT을 먼저 적용해 페이지에 필요한 (s)만 남긴 뒤, OPTIONAL MATCH로 표시용 속성 조회
         skip_count = (page - 1) * limit
         fetch_limit = limit + 1
+        pagination_with = ["s", "ds"]
+        if object_filters:
+            pagination_with += [f"{c.lower().replace(' ', '_').replace('/', '_')}_count" for c in object_filters.keys()]
 
         query += f"""
-        RETURN {', '.join(return_fields)}
-        ORDER BY ds.source, s.filepath
+        WITH {', '.join(pagination_with)}
+        ORDER BY id(s)
         SKIP $skip_count
         LIMIT $fetch_limit
+        OPTIONAL MATCH (s)-[:HAS_WEATHER]->(w:Weather)
+        OPTIONAL MATCH (s)-[:HAS_TIME_OF_DAY]->(t:TimeOfDay)
+        OPTIONAL MATCH (s)-[:HAS_ROAD_CONDITION]->(r:RoadCondition)
+        OPTIONAL MATCH (s)-[:HAS_CONTEXT]->(c:DrivingContext)
+        RETURN {', '.join(return_fields)}
         """
 
         query_params = {'skip_count': skip_count, 'fetch_limit': fetch_limit, 'datasets': datasets}
@@ -659,6 +662,8 @@ LIMIT $fetch_limit
             for i, (category, min_count) in enumerate(object_filters.items()):
                 query_params[f'category_{i}'] = category
                 query_params[f'min_{category.lower().replace(" ", "_").replace("/", "_")}'] = min_count
+
+        #logger.info("Query: %s", query)
 
         return query, query_params
 
@@ -779,6 +784,7 @@ LIMIT $fetch_limit
         )
         t_query_build = time.time() - t_query_build_start
         logger.info("[%s] Query build: %.2fms", search_type, t_query_build * 1000)
+        #logger.info("Query: %s", query)
         try:
             with self.driver.session(fetch_size=1000) as session:
                 t_db_start = time.time()
@@ -922,7 +928,7 @@ LIMIT $fetch_limit
                 pedestrian_density = [r['name'] for r in pedestrian_result if r['name']]
 
                 # Get dataset options   
-                dataset_result = session.run("MATCH (n:DataCatalog) RETURN n.name as name")
+                dataset_result = session.run("MATCH (n:DataCatalog) WHERE NOT n.name = 'Eval' RETURN n.name as name")
                 datasets = [r['name'] for r in dataset_result if r['name']]
 
                 # Get scenario tags   
