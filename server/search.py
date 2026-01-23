@@ -30,13 +30,14 @@ from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 from multilingual_clip import pt_multilingual_clip
 import transformers
+from sentence_transformers import SentenceTransformer
 
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from PIL import Image
 import io
 from dotenv import load_dotenv
@@ -94,12 +95,17 @@ class SearchResult(BaseModel):
     context: Dict[str, str]  # traffic_density, pedestrian_density
 
 class SearchScenarioResult(BaseModel):
+    model_config = ConfigDict(exclude_none=True)  # None인 필드는 JSON에서 제외
+    
     node_id: str
     dataset: str
     data_catalog_id: str
     scenario_id: str
     original_filepath: str
     scenario_tag: List[ScenarioTag]
+    score: Optional[float] = None  # Similarity score (for description search)
+    description: Optional[str] = None  # Scene description (for description search)
+    keywords: Optional[List[str]] = None  # Search keywords (for description search)
 
 class SearchScenarioResponse(BaseModel):
     results: List[SearchScenarioResult]
@@ -132,6 +138,10 @@ class UnifiedSearchEngine:
         # Multilingual CLIP for text queries (100+ languages)
         self.mclip_model = None
         self.mclip_tokenizer = None
+
+        # SentenceTransformer for scene description search (e5-base-v2)
+        self.scene_model = None
+        self.scene_model_name = "intfloat/e5-base-v2"
 
         logger.info(f"Initialized search engine on device: {self.device}")
 
@@ -208,6 +218,22 @@ class UnifiedSearchEngine:
                     """)
                     logger.info("Created Eval-specific CLIP image vector index")
 
+                # Create Scene search embedding index (e5-base-v2, 768 dimensions)
+                if 'scene_search_idx' not in index_names:
+                    logger.info("Creating Scene search vector index...")
+                    session.run("""
+                    CREATE VECTOR INDEX scene_search_idx IF NOT EXISTS
+                    FOR (sc:Scene)
+                    ON sc._search_embedding
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 768,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                    logger.info("Created Scene search vector index")
+
             logger.info("Vector indexes are ready")
             return True
 
@@ -229,10 +255,16 @@ class UnifiedSearchEngine:
             logger.info("   M-CLIP loaded successfully (supports 100+ languages)")
 
             # Load CLIP and preprocessing (for images)
-            logger.info("[2/2] Loading CLIP (ViT-L/14) visual model for images...")
+            logger.info("[2/3] Loading CLIP (ViT-L/14) visual model for images...")
             self.clip_model, self.clip_preprocess = clip.load("ViT-L/14", device=self.device)
             self.clip_model.eval()
             logger.info("   CLIP loaded successfully (768 dimensions)")
+
+            # Load SentenceTransformer for scene description search
+            logger.info("[3/3] Loading SentenceTransformer (e5-base-v2) for scene search...")
+            self.scene_model = SentenceTransformer(self.scene_model_name, device=self.device)
+            self.scene_model.eval()
+            logger.info("   SentenceTransformer loaded successfully (768 dimensions)")
 
             logger.info("=" * 60)
             logger.info("All models loaded successfully!")
@@ -262,6 +294,26 @@ class UnifiedSearchEngine:
         except Exception as e:
             logger.error("Failed to generate query embeddings: %s", e)
             return {'clip_text': None, 'query_text': ''}
+
+    def generate_scene_query_embedding(self, query: str) -> Optional[List[float]]:
+        """Generate embedding for scene search query using SentenceTransformer (e5-base-v2)
+
+        Note: e5 models use different prefixes for queries vs passages:
+        - "query: " prefix for search queries
+        - "passage: " prefix for documents/descriptions (used during indexing)
+        """
+        try:
+            # e5 models: use "query: " prefix for search queries
+            text_with_prefix = f"query: {query}"
+            embedding = self.scene_model.encode(text_with_prefix, normalize_embeddings=True)
+
+            query_preview = query[:50] + '...' if len(query) > 50 else query
+            logger.info("Generated scene query embedding for: '%s'", query_preview)
+            return embedding.tolist()
+
+        except Exception as e:
+            logger.error("Failed to generate scene query embedding: %s", e)
+            return None
 
     def generate_image_embeddings(self, image_bytes: bytes) -> Dict[str, Optional[List[float]]]:
         """Generate embeddings for uploaded image using CLIP"""
@@ -505,53 +557,126 @@ class UnifiedSearchEngine:
     def _build_scenario_filter_query(self, object_filters: Dict[str, int],
                                  scenario_tag: List[str], limit: int, page: int = 1) -> tuple:
 
-        query = f"""
-        MATCH (s:Scene)-[:HAS_EVENT]->(se:ScenarioEvent)
-        """
+        skip_count = (page - 1) * limit
+        fetch_limit = limit + 1
+        query_params = {'skip_count': skip_count, 'fetch_limit': fetch_limit}
 
-        filter_conditions = []
+        # 카테고리 변수명 생성 헬퍼
+        def cat_var(cat): return cat.lower().replace(' ', '_').replace('/', '_')
 
-        if scenario_tag:
-            query += "WHERE se.type IN $scenario_tag"
-
-        query += f"""
-        WITH s, collect(DISTINCT se) as scenario_events
-        WITH s, [se IN scenario_events | {{
-            type: se.type,
-            timestamp: se.timestamp,
-            timestep: se.timestep
-        }}] as scenario_tag
-        MATCH (s)-[:IN_CATALOG]->(ds:DataCatalog)
-        """
-
-
-        if filter_conditions:
-            query += f"WHERE {' AND '.join(filter_conditions)}"
-
-        # Return fields
+        # Base return fields
         return_fields = [
             "elementId(s) as node_id",
             "ds.name as dataset",
             "ds.catalog_id as data_catalog_id",
             "s.scenario_id as scenario_id",
-            "scenario_tag"        
+            "s._search_description as description",
+            "s._search_keywords as keywords",
+            "scenario_tag"
         ]
 
-        skip_count = (page - 1) * limit
-        fetch_limit = limit + 1
+        # Case 1: object_filters + scenario_tag 둘 다 있음
+        if object_filters and scenario_tag:
+            category_counts = [
+                f"sum(CASE WHEN o.label = $category_{i} THEN det_rel.count ELSE 0 END) as {cat_var(cat)}_count"
+                for i, cat in enumerate(object_filters.keys())
+            ]
+            object_conditions = [f"{cat_var(cat)}_count >= $min_{cat_var(cat)}" for cat in object_filters.keys()]
+            count_vars = [f"{cat_var(cat)}_count" for cat in object_filters.keys()]
 
-        query += f"""
-        RETURN {', '.join(return_fields)}
-        ORDER BY id(s)
-        SKIP $skip_count
-        LIMIT $fetch_limit
-        """
-
-        query_params = {'skip_count': skip_count, 'fetch_limit': fetch_limit}
-
-        if scenario_tag:
+            query = f"""
+            MATCH (s:Scene)-[:HAS_EVENT]->(se:ScenarioEvent)
+            WHERE se.type IN $scenario_tag
+            WITH DISTINCT s
+            MATCH (s)-[det_rel:DETECTED_OBJECT]->(o:Object)
+            WITH s, {', '.join(category_counts)}
+            WHERE {' AND '.join(object_conditions)}
+            WITH s, {', '.join(count_vars)}
+            ORDER BY id(s)
+            SKIP $skip_count
+            LIMIT $fetch_limit
+            MATCH (s)-[:IN_CATALOG]->(ds:DataCatalog)
+            MATCH (s)-[:HAS_EVENT]->(se:ScenarioEvent)
+            WHERE se.type IN $scenario_tag
+            WITH s, ds, {', '.join(count_vars)}, collect(DISTINCT {{
+                type: se.type,
+                timestamp: se.timestamp,
+                timestep: se.timestep
+            }}) as scenario_tag
+            RETURN {', '.join(return_fields + count_vars)}
+            """
             query_params['scenario_tag'] = scenario_tag
-        
+            for i, (category, min_count) in enumerate(object_filters.items()):
+                query_params[f'category_{i}'] = category
+                query_params[f'min_{cat_var(category)}'] = min_count
+
+        # Case 2: object_filters만 있음 (scenario_tag 없음)
+        elif object_filters:
+            category_counts = [
+                f"sum(CASE WHEN o.label = $category_{i} THEN det_rel.count ELSE 0 END) as {cat_var(cat)}_count"
+                for i, cat in enumerate(object_filters.keys())
+            ]
+            object_conditions = [f"{cat_var(cat)}_count >= $min_{cat_var(cat)}" for cat in object_filters.keys()]
+            count_vars = [f"{cat_var(cat)}_count" for cat in object_filters.keys()]
+
+            query = f"""
+            MATCH (s:Scene)-[det_rel:DETECTED_OBJECT]->(o:Object)
+            WITH s, {', '.join(category_counts)}
+            WHERE {' AND '.join(object_conditions)}
+            WITH s, {', '.join(count_vars)}
+            ORDER BY id(s)
+            SKIP $skip_count
+            LIMIT $fetch_limit
+            MATCH (s)-[:IN_CATALOG]->(ds:DataCatalog)
+            OPTIONAL MATCH (s)-[:HAS_EVENT]->(se:ScenarioEvent)
+            WITH s, ds, {', '.join(count_vars)}, collect(DISTINCT CASE WHEN se IS NOT NULL THEN {{
+                type: se.type,
+                timestamp: se.timestamp,
+                timestep: se.timestep
+            }} END) as scenario_tag_raw
+            WITH s, ds, {', '.join(count_vars)}, [t IN scenario_tag_raw WHERE t IS NOT NULL] as scenario_tag
+            RETURN {', '.join(return_fields + count_vars)}
+            """
+            for i, (category, min_count) in enumerate(object_filters.items()):
+                query_params[f'category_{i}'] = category
+                query_params[f'min_{cat_var(category)}'] = min_count
+
+        # Case 3: scenario_tag만 있음 (object_filters 없음)
+        elif scenario_tag:
+            query = f"""
+            MATCH (s:Scene)-[:HAS_EVENT]->(se:ScenarioEvent)
+            WHERE se.type IN $scenario_tag
+            WITH s, collect(DISTINCT {{
+                type: se.type,
+                timestamp: se.timestamp,
+                timestep: se.timestep
+            }}) as scenario_tag
+            MATCH (s)-[:IN_CATALOG]->(ds:DataCatalog)
+            WITH s, ds, scenario_tag
+            ORDER BY id(s)
+            SKIP $skip_count
+            LIMIT $fetch_limit
+            RETURN {', '.join(return_fields)}
+            """
+            query_params['scenario_tag'] = scenario_tag
+
+        # Case 4: 둘 다 없음 - 모든 Scene 조회
+        else:
+            query = f"""
+            MATCH (s:Scene)-[:IN_CATALOG]->(ds:DataCatalog)
+            OPTIONAL MATCH (s)-[:HAS_EVENT]->(se:ScenarioEvent)
+            WITH s, ds, collect(DISTINCT CASE WHEN se IS NOT NULL THEN {{
+                type: se.type,
+                timestamp: se.timestamp,
+                timestep: se.timestep
+            }} END) as scenario_tag_raw
+            WITH s, ds, [t IN scenario_tag_raw WHERE t IS NOT NULL] as scenario_tag
+            ORDER BY id(s)
+            SKIP $skip_count
+            LIMIT $fetch_limit
+            RETURN {', '.join(return_fields)}
+            """
+
         return query, query_params
 
     def _build_filter_only_query(self, datasets: List[str], object_filters: Dict[str, int],
@@ -667,6 +792,110 @@ class UnifiedSearchEngine:
 
         return query, query_params
 
+    def search_scenes_by_description(self, query: str, limit: int = 24, page: int = 1,
+                                       score_threshold: float = 0.9250) -> Dict:
+        """Search scenes by natural language description using vector similarity
+
+        Uses the scene_search_idx vector index with e5-base-v2 embeddings.
+
+        Args:
+            query: Natural language search query
+            limit: Maximum number of results to return
+            page: Page number for pagination (1-based)
+            score_threshold: Minimum similarity score threshold (default: 0.9300)
+        """
+        t_start = time.time()
+        search_type = "SCENE-DESCRIPTION"
+
+        # Generate query embedding
+        t_embed_start = time.time()
+        query_embedding = self.generate_scene_query_embedding(query)
+        if not query_embedding:
+            logger.error("Failed to generate scene query embedding")
+            return {'nodes': [], 'has_more': False}
+        t_embed = time.time() - t_embed_start
+        logger.info("[%s] Query embedding: %.2fms", search_type, t_embed * 1000)
+
+        skip_count = (page - 1) * limit
+        fetch_limit = limit + 1
+        k_candidates = min(page * limit * 10, 10000)  # Cap at 10k for scene search
+
+        # Neo4j vector similarity search using scene_search_idx
+        cypher = """
+        CALL db.index.vector.queryNodes('scene_search_idx', $k_candidates, $embedding)
+        YIELD node as sc, score
+        WHERE score >= $score_threshold
+        MATCH (sc)-[:IN_CATALOG]->(ds:DataCatalog)
+        OPTIONAL MATCH (sc)-[:HAS_EVENT]->(se:ScenarioEvent)
+        WITH sc, ds, score,
+             collect(DISTINCT CASE WHEN se IS NOT NULL THEN {
+                 type: se.type,
+                 timestamp: se.timestamp,
+                 timestep: se.timestep
+             } END) as scenario_tag_raw
+        WITH sc, ds, score,
+             [t IN scenario_tag_raw WHERE t IS NOT NULL] as scenario_tag
+        RETURN elementId(sc) as node_id,
+               ds.name as dataset,
+               ds.catalog_id as data_catalog_id,
+               sc.scenario_id as scenario_id,
+               sc.token as token,
+               sc._search_description as description,
+               sc._search_keywords as keywords,
+               score,
+               scenario_tag
+        ORDER BY score DESC
+        SKIP $skip_count
+        LIMIT $fetch_limit
+        """
+
+        try:
+            with self.driver.session(fetch_size=1000) as session:
+                t_db_start = time.time()
+                result = session.run(
+                    cypher,
+                    embedding=query_embedding,
+                    k_candidates=k_candidates,
+                    skip_count=skip_count,
+                    fetch_limit=fetch_limit,
+                    score_threshold=score_threshold
+                )
+
+                nodes = []
+                for record in result:
+                    nodes.append({
+                        'node_id': record['node_id'],
+                        'dataset': record['dataset'],
+                        'data_catalog_id': record['data_catalog_id'],
+                        'scenario_id': record['scenario_id'],
+                        'token': record['token'],
+                        'description': record['description'],
+                        'keywords': record['keywords'] or [],
+                        'score': record['score'],
+                        'scenario_tag': record['scenario_tag']
+                    })
+
+                t_db_total = time.time() - t_db_start
+                t_total = time.time() - t_start
+
+                logger.info("[%s] Neo4j query + fetch: %.2fms", search_type, t_db_total * 1000)
+                logger.info("[%s] Total search time: %.2fms (found %d results, page %d)",
+                           search_type, t_total * 1000, len(nodes), page)
+
+                has_more = len(nodes) > limit
+
+                return {
+                    'nodes': nodes[:limit],
+                    'has_more': has_more
+                }
+
+        except Exception as e:
+            logger.error("Scene search failed: %s", e)
+            # Fallback: try manual search if index not available
+            if "no such vector schema index" in str(e).lower():
+                logger.warning("Vector index 'scene_search_idx' not found. Please create it.")
+            return {'nodes': [], 'has_more': False}
+
     def search_scenario_nodes(self, scenario_tag: List[str],
                      object_filters: Dict[str, int] = None,
                      limit: int = 24,
@@ -706,6 +935,8 @@ class UnifiedSearchEngine:
                     data_catalog_id = record['data_catalog_id']
                     scenario_id = record['scenario_id']
                     scenario_tag = record['scenario_tag']
+                    description = record['description']
+                    keywords = record['keywords']
                     
                     nodes.append({
                         'node_id': node_id,
@@ -713,6 +944,8 @@ class UnifiedSearchEngine:
                         'data_catalog_id': data_catalog_id,
                         'scenario_id': scenario_id,
                         'scenario_tag': scenario_tag,
+                        'description': description,
+                        'keywords': keywords,
                     })
 
                 t_db_total = time.time() - t_db_start
@@ -1009,6 +1242,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.post("/scenario", response_model=SearchScenarioResponse)
 async def search_scenario(
+    query: str = Form(""),
     object_filters: str = Form("{}"),
     scenario_tag: str = Form("[]"),
     limit: int = Form(100),
@@ -1025,35 +1259,71 @@ async def search_scenario(
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=400, detail=f"Invalid JSON in parameters: {str(e)}")
 
-        search_type = "SCENARIO-FILTER"
+        query_text = query.strip() if query else ""
 
-        logger.info("[%s] Search started: limit=%d, page=%d", search_type, limit, page)
+        # If query text is provided, use SentenceTransformer for scene description search
+        if query_text:
+            search_type = "SCENARIO-DESCRIPTION"
+            logger.info("[%s] Search started: query='%s', limit=%d, page=%d",
+                       search_type, query_text[:50], limit, page)
 
-        # Search with unified function
-        t_search_start = time.time()
-        search_result = search_engine.search_scenario_nodes(
-            scenario_tag=scenario_tag_list,
-            object_filters=object_filters_dict,
-            limit=limit,
-            page=page
-        )
-        t_search = time.time() - t_search_start
+            t_search_start = time.time()
+            search_result = search_engine.search_scenes_by_description(
+                query=query_text,
+                limit=limit,
+                page=page
+            )
+            t_search = time.time() - t_search_start
 
-        nodes = search_result['nodes']
-        has_more = search_result['has_more']
+            nodes = search_result['nodes']
+            has_more = search_result['has_more']
 
-        # Format results
-        t_format_start = time.time()
-        results = []
-        for node in nodes:
-            results.append(SearchScenarioResult(
-                node_id=node['node_id'],
-                dataset=node['dataset'],
-                data_catalog_id=node['data_catalog_id'],
-                scenario_id=node['scenario_id'],
-                original_filepath= "https://bdd100k-dataset-images.s3.ap-northeast-1.amazonaws.com/train/0000f77c-6257be58.jpg",
-                scenario_tag=node['scenario_tag']
-            ))
+            # Format results for description search
+            t_format_start = time.time()
+            results = []
+            for node in nodes:
+                results.append(SearchScenarioResult(
+                    node_id=node['node_id'],
+                    dataset=node['dataset'],
+                    data_catalog_id=node['data_catalog_id'],
+                    scenario_id=node['scenario_id'],
+                    original_filepath="https://bdd100k-dataset-images.s3.ap-northeast-1.amazonaws.com/train/0000f77c-6257be58.jpg",
+                    scenario_tag=node['scenario_tag'],
+                    description=node.get('description'),
+                    keywords=node.get('keywords'),
+                    score=node.get('score')
+                ))
+        else:
+            # No query text - use tag/filter based search
+            search_type = "SCENARIO-FILTER"
+            logger.info("[%s] Search started: limit=%d, page=%d", search_type, limit, page)
+
+            t_search_start = time.time()
+            search_result = search_engine.search_scenario_nodes(
+                scenario_tag=scenario_tag_list,
+                object_filters=object_filters_dict,
+                limit=limit,
+                page=page
+            )
+            t_search = time.time() - t_search_start
+
+            nodes = search_result['nodes']
+            has_more = search_result['has_more']
+
+            # Format results for filter search
+            t_format_start = time.time()
+            results = []
+            for node in nodes:
+                results.append(SearchScenarioResult(
+                    node_id=node['node_id'],
+                    dataset=node['dataset'],
+                    data_catalog_id=node['data_catalog_id'],
+                    scenario_id=node['scenario_id'],
+                    original_filepath="https://bdd100k-dataset-images.s3.ap-northeast-1.amazonaws.com/train/0000f77c-6257be58.jpg",
+                    scenario_tag=node['scenario_tag'],
+                    description=node.get('description'),
+                    keywords=node.get('keywords')
+                ))
 
         t_format = time.time() - t_format_start
         t_api_total = time.time() - t_api_start
@@ -1062,7 +1332,9 @@ async def search_scenario(
                    search_type, t_api_total * 1000, len(results), page, has_more,
                    t_search * 1000, t_format * 1000)
 
-        return SearchScenarioResponse(results=results, page=page, has_more=has_more)
+        #logger.info("[%s API] Results: %s", search_type, results)
+        response = SearchScenarioResponse(results=results, page=page, has_more=has_more)
+        return JSONResponse(content=response.model_dump(exclude_none=True))
 
     except Exception as e:
         logger.error("[API] Search request failed: %s", e)
